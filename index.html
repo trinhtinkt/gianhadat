@@ -64,8 +64,8 @@ select{width:100%;font:inherit;font-size:16px;color:var(--tx);background:var(--c
   <button class="p" id="go">Tìm</button>
   <div class="chips" id="hist"></div>
   <div class="msg" id="status"></div>
-  <div id="land"></div>
   <div id="out"></div>
+  <div id="land"></div>
 </main>
 
 <dialog id="dlg">
@@ -165,7 +165,26 @@ function parseArr(t){
   const out=[],re=/\{[^{}]*\}/g;let m;while((m=re.exec(t))){try{out.push(JSON.parse(m[0]))}catch(e){}}return out;
 }
 function parseObj(t){t=t.replace(/```json|```/g,"");try{return JSON.parse(t.slice(t.indexOf("{"),t.lastIndexOf("}")+1))}catch(e){return null}}
-const dk=s=>{const t=Date.parse(s||"");return isNaN(t)?-1:t};
+function pd(s){
+  s=String(s||"");
+  if(/^\d{4}-\d{2}-\d{2}/.test(s)){const t=Date.parse(s);if(!isNaN(t))return t}
+  let m=s.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/);if(m)return Date.UTC(+m[3],+m[2]-1,+m[1]);
+  m=s.match(/tháng\s*(\d{1,2})\s*\/\s*(\d{4})/i);if(m)return Date.UTC(+m[2],+m[1]-1,1);
+  return -1;
+}
+const dk=pd;
+function stype(it){
+  const s=((it.url||"")+" "+(it.sourceName||"")).toLowerCase();
+  if(/facebook|fb\.com|fb\.watch/.test(s))return"Facebook";
+  const t=norm(it.sourceType);
+  if(t.includes("face"))return"Facebook";
+  if(t.includes("bao")||t.includes("news"))return"Báo";
+  if(t.includes("web"))return"Website";
+  return"Khác";
+}
+const GRP={Website:0,Facebook:1,"Báo":2,"Khác":3};
+const grp=it=>GRP[stype(it)];
+const sortItems=a=>a.sort((x,y)=>grp(x)-grp(y)||pd(y.postedAt)-pd(x.postedAt));
 
 /* ===== Bảng giá đất do người dùng cung cấp (lưu trong máy) ===== */
 function getLP(){try{const o=JSON.parse(ls.get("lp"));if(o&&Array.isArray(o.rows))return o}catch(e){}return{meta:{},rows:[]}}
@@ -185,60 +204,74 @@ function localLand(area,street){
     note:(!nar.length&&wards.size>1?"Có nhiều phường/xã cùng tên đường; hãy ghi thêm phường/xã vào ô khu vực để chọn đúng. ":"")+(use.length>4?"Còn "+(use.length-4)+" dòng khác. ":"")+"Lấy từ bảng giá bạn đã nhập, hãy cập nhật khi có văn bản mới."};
 }
 const CTX=r=>r.map((x,i)=>`[${i+1}] ${x.title||""}\n${x.url}\n${String(x.content||"").slice(0,600)}`).join("\n\n");
-async function tavily(q){
+async function tavily(q,opts={}){
   const key=ls.get("tkey");
   let r;
-  try{r=await fetch("https://api.tavily.com/search",{method:"POST",headers:{"content-type":"application/json",authorization:"Bearer "+key},body:JSON.stringify({query:q,search_depth:"basic",max_results:7})})}
+  try{r=await fetch("https://api.tavily.com/search",{method:"POST",headers:{"content-type":"application/json",authorization:"Bearer "+key},body:JSON.stringify({query:q,search_depth:"basic",max_results:7,...opts})})}
   catch(e){throw new Error("Không gọi được Tavily từ trình duyệt (có thể bị chặn). Hãy xóa khóa Tavily trong ⚙️ hoặc dùng bản chạy bằng máy chủ.")}
   const d=await r.json().catch(()=>({}));
   if(!r.ok)throw new Error("Tavily: "+((d.detail&&d.detail.error)||("lỗi "+r.status)));
   return (d.results||[]).filter(x=>okUrl(x.url));
 }
-async function lookup(area,street){
+/* Giai đoạn 1: tin đăng. Ưu tiên website (mới nhất trước), rồi Facebook, rồi báo. Tối thiểu 3 tin. */
+async function listingsPhase(area){
+  const k="L:"+norm(area),hit=cget(k);if(hit&&hit.items.length>=3)return{...hit,cached:true};
+  const tkey=ls.get("tkey");
+  let items=[],src=[];const seen=new Set();
+  for(let round=0;round<2&&items.length<3;round++){
+    let ctx="",res=[],allow=null;
+    if(tkey){
+      const tr=round?{}:{time_range:"month"};
+      const [web,fb]=await Promise.all([
+        tavily(round?`bán nhà đất đất nền ${area} và khu vực lân cận`:`tin đăng bán nhà đất ${area} mới nhất`,{exclude_domains:["facebook.com"],...tr}),
+        tavily(`bán nhà đất ${area}`,{include_domains:["facebook.com"],...tr}).catch(()=>[])
+      ]);
+      res=web.concat(fb);allow=new Set(res.map(x=>x.url));ctx=CTX(res);
+    }
+    const p=`Hôm nay là ${today()}. Khu vực: "${area}" (Việt Nam).
+${tkey?"Chỉ dùng thông tin trong các kết quả tìm kiếm sau, không bịa; url phải sao chép đúng từ kết quả.\n\nKẾT QUẢ TÌM KIẾM:\n"+ctx:"Dùng tìm kiếm web để lấy thông tin thật, không bịa; cần tìm cả website bất động sản/rao vặt và Facebook."}
+
+Trích tối đa 6 tin đăng BÁN nhà đất trong hoặc gần khu vực${round?", mở rộng sang khu vực lân cận cùng tỉnh":""}. Thứ tự: tin trên website bất động sản/rao vặt trước, sau đó Facebook, sau đó báo (kể cả thông báo đấu giá); trong mỗi nhóm, tin mới đăng nhất trước. Mỗi tin: {"title":"","price":"","size":"","address":"","postedAt":"YYYY-MM-DD hoặc 'tháng MM/YYYY' hoặc null","sourceType":"Website|Facebook|Báo|Khác","sourceName":"","url":""}. sourceType suy từ tên miền (facebook.com là Facebook). postedAt chỉ ghi khi có trong dữ liệu, không thì null.
+Trả về DUY NHẤT mảng JSON, không markdown.`;
+    const g=await gemini(p,{search:!tkey});
+    for(const x of parseArr(g.text)){
+      if(!x||!(x.title||x.url))continue;
+      if(!okUrl(x.url)||(allow&&!allow.has(x.url)))x.url=null;
+      const key=x.url||x.title;if(seen.has(key))continue;seen.add(key);
+      x.sourceType=stype(x);items.push(x);
+    }
+    src=src.concat(tkey?res.slice(0,6).map(x=>({title:x.title,uri:x.url})):g.src.slice(0,6));
+  }
+  sortItems(items);
+  const out={items,src:src.slice(0,8)};
+  if(items.length>=3)cset(k,out,TTL_LIST);
+  return out;
+}
+/* Giai đoạn 2: tra đơn giá đất theo vị trí trong bảng giá đất mới nhất */
+async function landPhase(area,loc){
+  const loc2=localLand(area,loc);if(loc2)return{land:loc2,cached:false};
   const M=getLP().meta,reg=M.regulation||"";
-  const kL="L:"+norm(area),kG="G:"+norm(area)+"|"+norm(street)+"|"+norm(reg);
-  let L=cget(kL),G=null,cachedL=!!L,cachedG=false;
-  const loc=localLand(area,street);
-  if(loc)G=loc;else{const c=cget(kG);if(c){G=c;cachedG=true}}
-  const needL=!L,needG=!G;
-  if(!needL&&!needG)return{items:L.items,src:L.src,land:G,cachedL,cachedG};
-  const tkey=ls.get("tkey");let ctxL="",ctxG="",resL=[],resG=[];
-  if(tkey){
-    const jobs=[];
-    if(needL)jobs.push(tavily(`tin đăng bán nhà đất ${area} mới nhất`).then(r=>resL=r));
-    if(needG)jobs.push(tavily(`bảng giá đất ${reg||"2026"} ${street} ${area}`).then(r=>resG=r));
-    await Promise.all(jobs);ctxL=CTX(resL);ctxG=CTX(resG);
-  }
-  const p=[`Hôm nay là ${today()}. Khu vực: "${area}"${street?`, đường/phố: "${street}"`:""} (Việt Nam).`];
-  if(tkey)p.push("Chỉ dùng thông tin có trong các kết quả tìm kiếm bên dưới, không bịa. Trường url phải sao chép đúng từ kết quả.");
-  else p.push("Dùng tìm kiếm web để lấy thông tin thật, không bịa.");
-  if(needL){
-    if(tkey)p.push("KẾT QUẢ TÌM KIẾM TIN ĐĂNG:\n"+ctxL);
-    p.push(`(A) Trích tối đa 5 tin đăng BÁN nhà đất trong hoặc gần khu vực, tin mới đăng nhất trước (kể cả thông báo đấu giá). Mỗi tin: {"title":"","price":"","size":"","address":"","postedAt":"YYYY-MM-DD hoặc 'tháng MM/YYYY' hoặc null","sourceType":"Website|Facebook|Báo|Khác","sourceName":"","url":""}. Không rõ thì null.`);
-  }
-  if(needG){
-    if(tkey)p.push("KẾT QUẢ TÌM KIẾM BẢNG GIÁ ĐẤT:\n"+ctxG);
-    p.push(`(B) Tìm đơn giá đất theo bảng giá đất của tỉnh. ${reg?`Tra theo ĐÚNG văn bản "${reg}"${M.province?" ("+M.province+")":""}; nếu đã bị thay thế bởi văn bản mới hơn, nêu rõ trong note.`:"Dùng bảng giá đất mới nhất của tỉnh (từ 01/01/2026, dùng đúng tỉnh sau sáp nhập 2025)."} Chỉ ghi giá khi thấy rõ cho đúng đường/đoạn/xã phường; không suy đoán. Bảng giá tính nghìn đồng/m² thì quy đổi sang đồng/m². Không thấy giá đúng đường thì matched=false, entries rỗng. Dạng: {"province":"","regulation":"số hiệu, cơ quan, ngày ban hành","effectiveFrom":"","matched":true,"entries":[{"segment":"","landType":"","price":"số đồng/m2"}],"sourceName":"","url":"","note":""}, tối đa 4 entries.`);
-  }
-  p.push(`Trả về DUY NHẤT một đối tượng JSON, không markdown: {${needL?'"listings":[...]':""}${needL&&needG?",":""}${needG?'"land":{...}':""}}`);
-  const g=await gemini(p.join("\n\n"),{search:!tkey});
-  const o=parseObj(g.text);
-  if(!o)throw new Error("Không đọc được kết quả từ AI, hãy thử lại.");
-  const allowL=new Set(resL.map(x=>x.url)),allowG=new Set(resG.map(x=>x.url));
-  if(needL){
-    let items=(Array.isArray(o.listings)?o.listings:[]).filter(x=>x&&(x.title||x.url));
-    items.forEach(x=>{if(!okUrl(x.url)||(tkey&&!allowL.has(x.url)))x.url=null});
-    items.sort((a,b)=>dk(b.postedAt)-dk(a.postedAt));
-    const src=tkey?resL.slice(0,6).map(x=>({title:x.title,uri:x.url})):g.src.slice(0,6);
-    L={items,src};if(items.length)cset(kL,L,TTL_LIST);
-  }
-  if(needG){
-    G=o.land;
-    if(!G)throw new Error("Không đọc được bảng giá đất từ AI.");
-    if(!okUrl(G.url)||(tkey&&!allowG.has(G.url)))G.url=tkey?((resG[0]&&resG[0].url)||null):((g.src[0]&&g.src[0].uri)||null);
-    if(G.matched!==false&&(G.entries||[]).length)cset(kG,G,TTL_LAND);
-  }
-  return{items:L.items,src:L.src,land:G,cachedL,cachedG};
+  const k="G:"+norm(area)+"|"+norm(loc)+"|"+norm(reg),hit=cget(k);if(hit)return{land:hit,cached:true};
+  const tkey=ls.get("tkey");let res=[],ctx="";
+  if(tkey){res=await tavily(`bảng giá đất ${reg||"2026"} ${loc} ${area}`);ctx=CTX(res)}
+  const p=`Hôm nay là ${today()}. Khu vực: "${area}". Vị trí cần tra giá: "${loc}" (Việt Nam).
+${tkey?"Chỉ dùng thông tin trong các kết quả tìm kiếm sau, không bịa; url phải sao chép đúng từ kết quả.\n\nKẾT QUẢ TÌM KIẾM:\n"+ctx:"Dùng tìm kiếm web để lấy thông tin thật, không bịa."}
+
+Tìm đơn giá đất theo bảng giá đất của tỉnh tại đúng vị trí trên (đường/đoạn/xã phường). ${reg?`Tra theo ĐÚNG văn bản "${reg}"${M.province?" ("+M.province+")":""}; nếu đã bị thay thế bởi văn bản mới hơn, nêu rõ trong note.`:"Dùng bảng giá đất MỚI NHẤT của tỉnh (từ 01/01/2026 theo Luật Đất đai 2024, dùng đúng tỉnh sau sáp nhập 2025, kiểm tra văn bản sửa đổi mới hơn)."} Chỉ ghi giá khi thấy rõ cho đúng vị trí; không suy đoán. Bảng giá tính nghìn đồng/m² thì quy đổi sang đồng/m². Không thấy giá đúng vị trí thì matched=false, entries rỗng.
+Trả về DUY NHẤT một đối tượng JSON, không markdown:
+{"province":"","regulation":"số hiệu, cơ quan, ngày ban hành","effectiveFrom":"","matched":true,"entries":[{"segment":"","landType":"","price":"số đồng/m2"}],"sourceName":"","url":"","note":""}
+Tối đa 4 entries.`;
+  const g=await gemini(p,{search:!tkey});
+  const o=parseObj(g.text);if(!o)throw new Error("Không đọc được bảng giá đất từ AI.");
+  const allow=new Set(res.map(x=>x.url));
+  if(!okUrl(o.url)||(tkey&&!allow.has(o.url)))o.url=tkey?((res[0]&&res[0].url)||null):((g.src[0]&&g.src[0].uri)||null);
+  if(o.matched!==false&&(o.entries||[]).length)cset(k,o,TTL_LAND);
+  return{land:o,cached:false};
+}
+async function showLand(area,loc,scroll){
+  $("land").innerHTML='<div class="skel"></div>';
+  try{const d=await landPhase(area,loc);renderLand(d.land,loc,d.cached)}catch(e){renderLand({error:e.message},loc)}
+  if(scroll)$("land").scrollIntoView({behavior:"smooth",block:"start"});
 }
 
 /* hiển thị */
@@ -253,17 +286,22 @@ function renderLand(l,street,cached){
   <div class="meta">Nguồn: ${esc(l.sourceName||"Không rõ")}${l.url?` · <a href="${esc(l.url)}" target="_blank" rel="noopener">Mở nguồn</a>`:""}${cached?" · ⚡ bộ nhớ đệm":""}</div>
   <div class="meta" style="margin-top:4px">Bảng giá đất là giá nhà nước dùng tính thuế, phí; không phải giá thị trường.</div></div>`;
 }
+const GL=["🌐 Trang web","📘 Facebook","📰 Báo","Nguồn khác"];
 function render(items,area){
+  let last=-1;
   $("out").innerHTML=items.map((it,i)=>{
+    const g=grp(it);let head="";
+    if(g!==last){head=`<div class="meta" style="margin-top:14px"><b>${GL[g]}</b></div>`;last=g}
     const addr=it.address||area, map="https://www.google.com/maps/search/?api=1&query="+encodeURIComponent(addr);
-    return `<div class="item">
-    <div class="top"><span class="rank">#${i+1}</span><span class="badge">${esc(it.sourceType||"Khác")}</span><span class="meta">${esc(it.postedAt||"Chưa rõ ngày đăng")}</span></div>
+    return head+`<div class="item">
+    <div class="top"><span class="rank">#${i+1}</span><span class="badge">${esc(stype(it))}</span><span class="meta">${esc(it.postedAt||"Chưa rõ ngày đăng")}</span></div>
     <div><b>${esc(it.title||"Tin bán nhà đất")}</b></div>
     <div class="price">${esc(it.price||"Chưa rõ giá")}${it.size?" · "+esc(it.size):""}</div>
     <div class="meta">📍 ${esc(addr)}</div>
     <div class="meta">Nguồn: ${esc(it.sourceName||"Không rõ")}</div>
-    <div class="acts">${okUrl(it.url)?`<a href="${esc(it.url)}" target="_blank" rel="noopener">Mở tin gốc</a>`:""}<a href="${map}" target="_blank" rel="noopener">Bản đồ</a><button data-i="${i}" class="sh">Chia sẻ</button></div>
+    <div class="acts">${okUrl(it.url)?`<a href="${esc(it.url)}" target="_blank" rel="noopener">Mở tin gốc</a>`:""}<a href="${map}" target="_blank" rel="noopener">Bản đồ</a><button data-i="${i}" class="lk">💰 Giá đất</button><button data-i="${i}" class="sh">Chia sẻ</button></div>
   </div>`}).join("");
+  document.querySelectorAll(".lk").forEach(b=>b.onclick=()=>showLand(area,items[b.dataset.i].address||area,true));
   document.querySelectorAll(".sh").forEach(b=>b.onclick=()=>{
     const it=items[b.dataset.i],t=`${it.title||"Tin bán nhà đất"} - ${it.price||""} - ${it.address||area}\n${okUrl(it.url)?it.url:""}`;
     if(navigator.share)navigator.share({text:t}).catch(()=>{});else if(navigator.clipboard){navigator.clipboard.writeText(t);b.textContent="Đã chép"}
@@ -285,18 +323,22 @@ function drawHist(){
 async function run(){
   const area=$("area").value.trim(),street=$("street").value.trim();
   if(!area){$("status").textContent="Hãy nhập tên khu vực.";return}
-  $("go").disabled=true;$("status").className="msg";$("status").textContent="Đang tìm...";
-  $("land").innerHTML='<div class="skel"></div>';$("out").innerHTML='<div class="skel"></div><div class="skel"></div><div class="skel"></div>';
-  addHist(area,street);const t0=Date.now();
+  $("go").disabled=true;$("status").className="msg";$("status").textContent="Bước 1/2: đang tìm tin đăng (website trước, rồi Facebook)...";
+  $("land").innerHTML="";$("out").innerHTML='<div class="skel"></div><div class="skel"></div><div class="skel"></div>';
+  addHist(area,street);const t0=Date.now();let loc=street||area;
   try{
-    const d=await lookup(area,street);
-    renderLand(d.land,street,d.cachedG);
+    const d=await listingsPhase(area);
     if(!d.items.length){$("out").innerHTML="";throw new Error("Không tìm thấy tin phù hợp. Thử tên khu vực khác.")}
     render(d.items,area);$("out").insertAdjacentHTML("beforeend",srcList(d.src));
-    $("status").textContent=(d.items.length<3?"Mới tìm được "+d.items.length+" tin, hãy thử khu vực rộng hơn. ":"Tìm thấy "+d.items.length+" tin, mới nhất ở trên. ")+(d.cachedL?"⚡ Từ bộ nhớ đệm. ":"")+"("+((Date.now()-t0)/1000).toFixed(1)+" giây) Hãy mở tin gốc để kiểm tra trước khi giao dịch.";
+    const c=[0,0,0,0];d.items.forEach(x=>c[grp(x)]++);
+    $("status").textContent="Tìm thấy "+d.items.length+" tin ("+c[0]+" website, "+c[1]+" Facebook"+(c[2]+c[3]?", "+(c[2]+c[3])+" báo/khác":"")+")"+(d.items.length<3?" - chưa đủ 3 tin, hãy thử khu vực rộng hơn. ":". ")+(d.cached?"⚡ Từ bộ nhớ đệm. ":"")+"("+((Date.now()-t0)/1000).toFixed(1)+" giây) Đang tra giá đất...";
+    if(!street){const a=(d.items.find(x=>x.address)||{}).address;if(a)loc=a}
   }catch(e){
-    $("land").innerHTML="";$("out").innerHTML="";$("status").className="msg err";$("status").textContent="Lỗi: "+(e.message||e);
+    $("out").innerHTML="";$("status").className="msg err";$("status").textContent="Lỗi: "+(e.message||e);
+    if(!street){$("go").disabled=false;return}
   }
+  await showLand(area,loc,false);
+  if($("status").className.indexOf("err")<0)$("status").textContent=$("status").textContent.replace(" Đang tra giá đất...","")+" Hãy mở tin gốc để kiểm tra trước khi giao dịch.";
   $("go").disabled=false;
 }
 
