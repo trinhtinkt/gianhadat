@@ -72,8 +72,10 @@ select{width:100%;font:inherit;font-size:16px;color:var(--tx);background:var(--c
   <b>Cài đặt</b>
   <p class="meta">Khóa Gemini miễn phí lấy tại <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com/apikey</a>. Khóa chỉ lưu trên điện thoại của bạn.</p>
   <input id="key" type="password" placeholder="Dán khóa Gemini API" autocomplete="off">
+  <input id="tkey" type="password" class="gap" placeholder="Khóa Tavily (tìm web miễn phí, nên có)" autocomplete="off">
+  <p class="meta">Lấy khóa Tavily miễn phí tại <a href="https://app.tavily.com" target="_blank" rel="noopener">app.tavily.com</a>. Có khóa này, Gemini chỉ đọc kết quả nên tiết kiệm hạn mức.</p>
   <input id="model" class="gap" placeholder="Model (để trống = tự động)" autocomplete="off">
-  <p class="meta">Nếu Google ngừng một model, app tự chuyển sang model mới. Bạn cũng có thể nhập tên model thủ công, VD gemini-3.8-flash.</p>
+  <p class="meta">Để trống thì app tự chọn và tự chuyển model khi hết hạn mức hoặc model bị ngừng.</p>
   <button class="p" id="save">Lưu</button>
   <button class="p" id="clr" style="background:transparent;color:var(--mu);border:1px solid var(--bd)">Xóa bộ nhớ đệm &amp; lịch sử</button>
   <button class="p" id="close" style="background:transparent;color:var(--tx);border:1px solid var(--bd)">Đóng</button>
@@ -108,7 +110,7 @@ select{width:100%;font:inherit;font-size:16px;color:var(--tx);background:var(--c
 <script>
 const $=id=>document.getElementById(id);
 const esc=s=>{const d=document.createElement("div");d.textContent=s==null?"":String(s);return d.innerHTML};
-const DEFAULT_MODEL="gemini-3.8-flash", FALLBACK=["gemini-3.8-flash","gemini-3-flash-preview","gemini-2.5-flash"], TTL_LIST=4*3600e3, TTL_LAND=7*24*3600e3;
+const DEFAULT_MODEL="gemini-3.5-flash-lite", FALLBACK=["gemini-3.5-flash-lite","gemini-3.1-flash-lite","gemini-3.8-flash"], TTL_LIST=4*3600e3, TTL_LAND=7*24*3600e3;
 const today=()=>new Date().toLocaleDateString("vi-VN",{timeZone:"Asia/Ho_Chi_Minh"});
 const norm=s=>String(s||"").normalize("NFD").replace(/[\u0300-\u036f]/g,"").replace(/đ/g,"d").replace(/Đ/g,"D").toLowerCase().replace(/\s+/g," ").trim();
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -120,29 +122,34 @@ function cget(k){try{const c=JSON.parse(ls.get("c:"+k));return c&&c.exp>Date.now
 function cset(k,v,ttl){ls.set("c:"+k,JSON.stringify({v,exp:Date.now()+ttl}))}
 
 /* Gemini */
+let autoModel=null;
 async function gemini(prompt,{search=true,file=null}={}){
   const key=ls.get("gkey");
   if(!key){$("dlg").showModal();throw new Error("Hãy nhập khóa Gemini trong phần cài đặt.")}
   const parts=[{text:prompt}];if(file)parts.push({inline_data:{mime_type:file.mime,data:file.data}});
   const body={contents:[{parts}]};if(search)body.tools=[{google_search:{}}];
-  let model=ls.get("model")||DEFAULT_MODEL,retried=false;const tried=new Set();
-  for(let i=0;i<5;i++){
+  const manual=ls.get("model2");
+  let model=manual||autoModel||DEFAULT_MODEL,retried=false,last="";const tried=new Set();
+  for(let i=0;i<7;i++){
     tried.add(model);
     const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,{
       method:"POST",headers:{"content-type":"application/json","x-goog-api-key":key},body:JSON.stringify(body)});
-    if((r.status===429||r.status===503)&&!retried){retried=true;await sleep(2500);continue}
-    const d=await r.json();
+    const d=await r.json().catch(()=>({error:{message:"Phản hồi không hợp lệ ("+r.status+")"}}));
     if(d.error){
-      const em=d.error.message||"";
+      const em=d.error.message||"";last=em;
+      if(r.status===429||r.status===503){
+        if(!retried){retried=true;await sleep(3000);continue}
+        const next=FALLBACK.find(m=>!tried.has(m));
+        if(next&&!manual){model=next;autoModel=next;retried=false;continue}
+        throw new Error((r.status===429?"Hết hạn mức miễn phí: ":"Máy chủ Gemini quá tải: ")+em.slice(0,200));
+      }
       if(/no longer available|is not found|not supported for generateContent/i.test(em)){
-        // Model đã ngừng cấp: dùng model Google gợi ý, hoặc thử lần lượt các model dự phòng
         const sg=(em.match(/use\s+models\/([\w.\-]+)/i)||[])[1];
         const next=(sg&&!tried.has(sg)&&sg)||FALLBACK.find(m=>!tried.has(m));
-        if(next){model=next;ls.set("model",model);continue}
-        throw new Error("Các model Gemini đều không khả dụng. Hãy nhập tên model mới trong cài đặt ⚙️.");
+        if(next&&!manual){model=next;autoModel=next;continue}
+        throw new Error("Model không khả dụng: "+em.slice(0,160)+" Hãy nhập tên model khác trong ⚙️.");
       }
-      if(r.status===429)throw new Error("Hết hạn mức miễn phí tạm thời, thử lại sau ít phút.");
-      if(r.status===400||r.status===403)throw new Error("Khóa Gemini không hợp lệ hoặc yêu cầu bị từ chối.");
+      if(r.status===400||r.status===403)throw new Error("Khóa không hợp lệ hoặc tính năng không được phép: "+em.slice(0,200));
       throw new Error(em||"Lỗi Gemini");
     }
     const c=(d.candidates||[])[0]||{};
@@ -150,7 +157,7 @@ async function gemini(prompt,{search=true,file=null}={}){
     const src=((c.groundingMetadata||{}).groundingChunks||[]).map(x=>x.web).filter(Boolean).map(w=>({title:w.title||"",uri:w.uri||""})).filter(w=>okUrl(w.uri));
     return{text,src};
   }
-  throw new Error("Không gọi được Gemini, thử lại sau.");
+  throw new Error("Không gọi được Gemini"+(last?": "+last.slice(0,160):""));
 }
 function parseArr(t){
   t=t.replace(/```json|```/g,"");
@@ -160,18 +167,6 @@ function parseArr(t){
 function parseObj(t){t=t.replace(/```json|```/g,"");try{return JSON.parse(t.slice(t.indexOf("{"),t.lastIndexOf("}")+1))}catch(e){return null}}
 const dk=s=>{const t=Date.parse(s||"");return isNaN(t)?-1:t};
 
-async function listings(area){
-  const k="L:"+norm(area),hit=cget(k);if(hit)return{...hit,cached:true};
-  const g=await gemini(`Hôm nay là ${today()}. Tìm các tin đăng BÁN nhà đất trong hoặc gần "${area}" (Việt Nam), ưu tiên tin mới đăng nhất, từ website bất động sản/rao vặt, Facebook, báo (kể cả thông báo đấu giá).
-Trả về DUY NHẤT mảng JSON 5 phần tử, sắp xếp mới nhất trước, không markdown. Mỗi phần tử:
-{"title":"","price":"","size":"","address":"","postedAt":"YYYY-MM-DD hoặc 'tháng MM/YYYY' hoặc null","sourceType":"Website|Facebook|Báo|Khác","sourceName":"","url":""}
-Chỉ dùng thông tin thật, không bịa; không rõ thì null.`);
-  let items=parseArr(g.text).filter(x=>x&&(x.title||x.url)).filter(x=>!x.url||okUrl(x.url));
-  items.sort((a,b)=>dk(b.postedAt)-dk(a.postedAt));
-  const out={items,src:g.src.slice(0,6)};
-  if(items.length)cset(k,out,TTL_LIST);
-  return out;
-}
 /* ===== Bảng giá đất do người dùng cung cấp (lưu trong máy) ===== */
 function getLP(){try{const o=JSON.parse(ls.get("lp"));if(o&&Array.isArray(o.rows))return o}catch(e){}return{meta:{},rows:[]}}
 function saveLP(o){try{localStorage.setItem("lp",JSON.stringify(o));return true}catch(e){return false}}
@@ -189,20 +184,61 @@ function localLand(area,street){
     sourceName:"File bạn tải lên"+(M.fileName?": "+M.fileName:"")+(M.updatedAt?" (cập nhật "+M.updatedAt+")":""),url:null,
     note:(!nar.length&&wards.size>1?"Có nhiều phường/xã cùng tên đường; hãy ghi thêm phường/xã vào ô khu vực để chọn đúng. ":"")+(use.length>4?"Còn "+(use.length-4)+" dòng khác. ":"")+"Lấy từ bảng giá bạn đã nhập, hãy cập nhật khi có văn bản mới."};
 }
-async function land(area,street){
-  const loc=localLand(area,street);if(loc)return{land:loc,cached:false};
+const CTX=r=>r.map((x,i)=>`[${i+1}] ${x.title||""}\n${x.url}\n${String(x.content||"").slice(0,600)}`).join("\n\n");
+async function tavily(q){
+  const key=ls.get("tkey");
+  let r;
+  try{r=await fetch("https://api.tavily.com/search",{method:"POST",headers:{"content-type":"application/json",authorization:"Bearer "+key},body:JSON.stringify({query:q,search_depth:"basic",max_results:7})})}
+  catch(e){throw new Error("Không gọi được Tavily từ trình duyệt (có thể bị chặn). Hãy xóa khóa Tavily trong ⚙️ hoặc dùng bản chạy bằng máy chủ.")}
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok)throw new Error("Tavily: "+((d.detail&&d.detail.error)||("lỗi "+r.status)));
+  return (d.results||[]).filter(x=>okUrl(x.url));
+}
+async function lookup(area,street){
   const M=getLP().meta,reg=M.regulation||"";
-  const k="G:"+norm(area)+"|"+norm(street)+"|"+norm(reg),hit=cget(k);if(hit)return{land:hit,cached:true};
-  const g=await gemini(`Hôm nay là ${today()}. Khu vực: "${area}"${street?`, đường/phố: "${street}"`:""} (Việt Nam).
-${reg?`Người dùng yêu cầu tra theo ĐÚNG văn bản: "${reg}"${M.province?" ("+M.province+")":""}. Nếu văn bản này đã bị thay thế hoặc sửa đổi bởi văn bản mới hơn, hãy nêu rõ trong note.`:"Tìm đơn giá đất theo BẢNG GIÁ ĐẤT MỚI NHẤT do HĐND/UBND tỉnh nơi có khu vực này ban hành (từ 01/01/2026 theo Luật Đất đai 2024; dùng đúng tỉnh sau sáp nhập 2025, kiểm tra văn bản sửa đổi mới hơn)."}
-Ưu tiên nguồn chính thống. Chỉ ghi giá khi thấy rõ cho đúng đường/đoạn/xã phường; không suy đoán, không bịa. Bảng giá tính nghìn đồng/m² thì quy đổi sang đồng/m². Không thấy giá đúng đường thì matched=false, entries rỗng.
-Trả về DUY NHẤT một đối tượng JSON, không markdown:
-{"province":"","regulation":"số hiệu, cơ quan, ngày ban hành","effectiveFrom":"","matched":true,"entries":[{"segment":"","landType":"","price":"số đồng/m2"}],"sourceName":"","url":"","note":""}
-Tối đa 4 entries.`);
-  const o=parseObj(g.text);if(!o)throw new Error("Không đọc được bảng giá đất.");
-  if(!okUrl(o.url))o.url=(g.src[0]&&g.src[0].uri)||null;
-  if(o.matched!==false&&(o.entries||[]).length)cset(k,o,TTL_LAND);
-  return{land:o,cached:false};
+  const kL="L:"+norm(area),kG="G:"+norm(area)+"|"+norm(street)+"|"+norm(reg);
+  let L=cget(kL),G=null,cachedL=!!L,cachedG=false;
+  const loc=localLand(area,street);
+  if(loc)G=loc;else{const c=cget(kG);if(c){G=c;cachedG=true}}
+  const needL=!L,needG=!G;
+  if(!needL&&!needG)return{items:L.items,src:L.src,land:G,cachedL,cachedG};
+  const tkey=ls.get("tkey");let ctxL="",ctxG="",resL=[],resG=[];
+  if(tkey){
+    const jobs=[];
+    if(needL)jobs.push(tavily(`tin đăng bán nhà đất ${area} mới nhất`).then(r=>resL=r));
+    if(needG)jobs.push(tavily(`bảng giá đất ${reg||"2026"} ${street} ${area}`).then(r=>resG=r));
+    await Promise.all(jobs);ctxL=CTX(resL);ctxG=CTX(resG);
+  }
+  const p=[`Hôm nay là ${today()}. Khu vực: "${area}"${street?`, đường/phố: "${street}"`:""} (Việt Nam).`];
+  if(tkey)p.push("Chỉ dùng thông tin có trong các kết quả tìm kiếm bên dưới, không bịa. Trường url phải sao chép đúng từ kết quả.");
+  else p.push("Dùng tìm kiếm web để lấy thông tin thật, không bịa.");
+  if(needL){
+    if(tkey)p.push("KẾT QUẢ TÌM KIẾM TIN ĐĂNG:\n"+ctxL);
+    p.push(`(A) Trích tối đa 5 tin đăng BÁN nhà đất trong hoặc gần khu vực, tin mới đăng nhất trước (kể cả thông báo đấu giá). Mỗi tin: {"title":"","price":"","size":"","address":"","postedAt":"YYYY-MM-DD hoặc 'tháng MM/YYYY' hoặc null","sourceType":"Website|Facebook|Báo|Khác","sourceName":"","url":""}. Không rõ thì null.`);
+  }
+  if(needG){
+    if(tkey)p.push("KẾT QUẢ TÌM KIẾM BẢNG GIÁ ĐẤT:\n"+ctxG);
+    p.push(`(B) Tìm đơn giá đất theo bảng giá đất của tỉnh. ${reg?`Tra theo ĐÚNG văn bản "${reg}"${M.province?" ("+M.province+")":""}; nếu đã bị thay thế bởi văn bản mới hơn, nêu rõ trong note.`:"Dùng bảng giá đất mới nhất của tỉnh (từ 01/01/2026, dùng đúng tỉnh sau sáp nhập 2025)."} Chỉ ghi giá khi thấy rõ cho đúng đường/đoạn/xã phường; không suy đoán. Bảng giá tính nghìn đồng/m² thì quy đổi sang đồng/m². Không thấy giá đúng đường thì matched=false, entries rỗng. Dạng: {"province":"","regulation":"số hiệu, cơ quan, ngày ban hành","effectiveFrom":"","matched":true,"entries":[{"segment":"","landType":"","price":"số đồng/m2"}],"sourceName":"","url":"","note":""}, tối đa 4 entries.`);
+  }
+  p.push(`Trả về DUY NHẤT một đối tượng JSON, không markdown: {${needL?'"listings":[...]':""}${needL&&needG?",":""}${needG?'"land":{...}':""}}`);
+  const g=await gemini(p.join("\n\n"),{search:!tkey});
+  const o=parseObj(g.text);
+  if(!o)throw new Error("Không đọc được kết quả từ AI, hãy thử lại.");
+  const allowL=new Set(resL.map(x=>x.url)),allowG=new Set(resG.map(x=>x.url));
+  if(needL){
+    let items=(Array.isArray(o.listings)?o.listings:[]).filter(x=>x&&(x.title||x.url));
+    items.forEach(x=>{if(!okUrl(x.url)||(tkey&&!allowL.has(x.url)))x.url=null});
+    items.sort((a,b)=>dk(b.postedAt)-dk(a.postedAt));
+    const src=tkey?resL.slice(0,6).map(x=>({title:x.title,uri:x.url})):g.src.slice(0,6);
+    L={items,src};if(items.length)cset(kL,L,TTL_LIST);
+  }
+  if(needG){
+    G=o.land;
+    if(!G)throw new Error("Không đọc được bảng giá đất từ AI.");
+    if(!okUrl(G.url)||(tkey&&!allowG.has(G.url)))G.url=tkey?((resG[0]&&resG[0].url)||null):((g.src[0]&&g.src[0].uri)||null);
+    if(G.matched!==false&&(G.entries||[]).length)cset(kG,G,TTL_LAND);
+  }
+  return{items:L.items,src:L.src,land:G,cachedL,cachedG};
 }
 
 /* hiển thị */
@@ -249,22 +285,25 @@ function drawHist(){
 async function run(){
   const area=$("area").value.trim(),street=$("street").value.trim();
   if(!area){$("status").textContent="Hãy nhập tên khu vực.";return}
-  $("go").disabled=true;$("status").className="msg";$("status").textContent="Đang tìm... kết quả nào xong sẽ hiện ngay.";
+  $("go").disabled=true;$("status").className="msg";$("status").textContent="Đang tìm...";
   $("land").innerHTML='<div class="skel"></div>';$("out").innerHTML='<div class="skel"></div><div class="skel"></div><div class="skel"></div>';
   addHist(area,street);const t0=Date.now();
-  const lp=land(area,street).then(d=>renderLand(d.land,street,d.cached)).catch(e=>renderLand({error:e.message},street));
-  const sp=listings(area).then(d=>{
-    if(!d.items.length)throw new Error("Không tìm thấy tin phù hợp. Thử tên khu vực khác.");
+  try{
+    const d=await lookup(area,street);
+    renderLand(d.land,street,d.cachedG);
+    if(!d.items.length){$("out").innerHTML="";throw new Error("Không tìm thấy tin phù hợp. Thử tên khu vực khác.")}
     render(d.items,area);$("out").insertAdjacentHTML("beforeend",srcList(d.src));
-    $("status").textContent=(d.items.length<3?"Mới tìm được "+d.items.length+" tin, hãy thử khu vực rộng hơn. ":"Tìm thấy "+d.items.length+" tin, mới nhất ở trên. ")+(d.cached?"⚡ Từ bộ nhớ đệm. ":"")+"("+((Date.now()-t0)/1000).toFixed(1)+" giây) Hãy mở tin gốc để kiểm tra trước khi giao dịch.";
-  }).catch(e=>{$("out").innerHTML="";$("status").className="msg err";$("status").textContent="Lỗi: "+(e.message||e)});
-  await Promise.all([lp,sp]);$("go").disabled=false;
+    $("status").textContent=(d.items.length<3?"Mới tìm được "+d.items.length+" tin, hãy thử khu vực rộng hơn. ":"Tìm thấy "+d.items.length+" tin, mới nhất ở trên. ")+(d.cachedL?"⚡ Từ bộ nhớ đệm. ":"")+"("+((Date.now()-t0)/1000).toFixed(1)+" giây) Hãy mở tin gốc để kiểm tra trước khi giao dịch.";
+  }catch(e){
+    $("land").innerHTML="";$("out").innerHTML="";$("status").className="msg err";$("status").textContent="Lỗi: "+(e.message||e);
+  }
+  $("go").disabled=false;
 }
 
 $("go").onclick=run;
 ["area","street"].forEach(i=>$(i).addEventListener("keydown",e=>{if(e.key==="Enter")run()}));
-$("cfg").onclick=()=>{$("key").value=ls.get("gkey")||"";$("model").value=ls.get("model")||"";$("dlg").showModal()};
-$("save").onclick=()=>{const v=$("key").value.trim();if(v)ls.set("gkey",v);const m=$("model").value.trim();if(m)ls.set("model",m);else ls.del("model");$("dlg").close()};
+$("cfg").onclick=()=>{$("key").value=ls.get("gkey")||"";$("model").value=ls.get("model2")||"";$("tkey").value=ls.get("tkey")||"";$("dlg").showModal()};
+$("save").onclick=()=>{const v=$("key").value.trim();if(v)ls.set("gkey",v);const m=$("model").value.trim();if(m)ls.set("model2",m);else ls.del("model2");const t=$("tkey").value.trim();if(t)ls.set("tkey",t);else ls.del("tkey");$("dlg").close()};
 $("close").onclick=()=>$("dlg").close();
 $("clr").onclick=()=>{try{Object.keys(localStorage).filter(k=>k.startsWith("c:")||k==="hist").forEach(k=>localStorage.removeItem(k))}catch(e){}drawHist();$("dlg").close()};
 
